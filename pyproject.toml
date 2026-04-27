@@ -47,6 +47,7 @@ peft = ["peft"]
 llm2vec = ["llm2vec"]
 dev = ["pytest", "pytest-cov", "pre-commit"]
 faiss = ["faiss-cpu"]
+hyde = ["openai"]
 
 [project.urls]
 Homepage = "https://github.com/beir-cellar/beir"

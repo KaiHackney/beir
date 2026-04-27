@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .bpr import BinarySentenceBERT
+from .hyde import HyDE, HyDEPromptBuilder, OpenAIHypothesisGenerator
 from .huggingface import HuggingFace
 from .llm2vec import LLM2Vec
 from .nvembed import NVEmbed
@@ -13,9 +14,12 @@ from .vllm import VLLMEmbed
 
 __all__ = [
     "BinarySentenceBERT",
+    "HyDE",
+    "HyDEPromptBuilder",
     "HuggingFace",
     "LLM2Vec",
     "NVEmbed",
+    "OpenAIHypothesisGenerator",
     "SentenceBERT",
     "SPARTA",
     "SPLADE",
