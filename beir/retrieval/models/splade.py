@@ -15,32 +15,118 @@ from .util import extract_corpus_sentences
 logger = logging.getLogger(__name__)
 
 
+class SparseEncoderSPLADE:
+    def __init__(
+        self,
+        model_path: str,
+        sep: str = " ",
+        max_active_dims: int | None = None,
+        title_weight: float = 1.0,
+        convert_to_tensor: bool = True,
+        **kwargs,
+    ):
+        try:
+            from sentence_transformers import SparseEncoder
+        except ImportError as exc:
+            raise ImportError(
+                "Install sentence-transformers with SparseEncoder support to use SparseEncoderSPLADE."
+            ) from exc
+
+        self.model = SparseEncoder(model_path, **kwargs)
+        self.sep = sep
+        self.max_active_dims = max_active_dims
+        self.title_weight = title_weight
+        self.convert_to_tensor = convert_to_tensor
+
+    def encode_queries(self, queries: list[str], batch_size: int, **kwargs) -> np.ndarray | Tensor:
+        return self._encode(self.model.encode_query, queries, batch_size, **kwargs)
+
+    def encode_corpus(
+        self, corpus: list[dict[str, str]] | dict[str, list] | list[str], batch_size: int, **kwargs
+    ) -> np.ndarray | Tensor:
+        if self.title_weight == 1.0 or self._is_string_corpus(corpus):
+            sentences = extract_corpus_sentences(corpus=corpus, sep=self.sep)
+            return self._encode(self.model.encode_document, sentences, batch_size, **kwargs)
+
+        titles, texts = self._extract_titles_texts(corpus)
+        text_embeddings = self._encode(self.model.encode_document, texts, batch_size, **kwargs)
+        title_embeddings = self._encode(self.model.encode_document, titles, batch_size, **kwargs)
+        return text_embeddings + (self.title_weight * title_embeddings)
+
+    def _encode(self, encode_fn, texts: list[str], batch_size: int, **kwargs) -> np.ndarray | Tensor:
+        embeddings = encode_fn(
+            texts,
+            batch_size=batch_size,
+            show_progress_bar=kwargs.get("show_progress_bar", True),
+            convert_to_tensor=self.convert_to_tensor,
+            convert_to_sparse_tensor=False,
+            max_active_dims=self.max_active_dims,
+        )
+        if isinstance(embeddings, torch.Tensor) and embeddings.is_sparse:
+            embeddings = embeddings.to_dense()
+        return embeddings
+
+    @staticmethod
+    def _is_string_corpus(corpus: list[dict[str, str]] | dict[str, list] | list[str]) -> bool:
+        return isinstance(corpus, list) and len(corpus) > 0 and isinstance(corpus[0], str)
+
+    @staticmethod
+    def _extract_titles_texts(corpus: list[dict[str, str]] | dict[str, list]) -> tuple[list[str], list[str]]:
+        if isinstance(corpus, dict):
+            titles = corpus.get("title") or [""] * len(corpus["text"])
+            texts = corpus["text"]
+            return [title or "" for title in titles], [text or "" for text in texts]
+
+        titles = []
+        texts = []
+        for doc in corpus:
+            titles.append(doc.get("title") or "")
+            texts.append(doc.get("text") or "")
+        return titles, texts
+
+
 class SPLADE:
     def __init__(self, model_path: str = None, sep: str = " ", max_length: int = 256, **kwargs):
         self.max_length = max_length
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        self.model = SpladeNaver(model_path)
+        self.revision = kwargs.get("revision", None)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, revision=self.revision)
+        self.model = SpladeNaver(model_path, revision=self.revision)
         self.sep = sep
         self.model.eval()
 
     # Write your own encoding query function (Returns: Query embeddings as numpy array)
     def encode_queries(self, queries: list[str], batch_size: int, **kwargs) -> np.ndarray:
-        return self.model.encode_sentence_bert(self.tokenizer, queries, is_q=True, maxlen=self.max_length)
+        return self.model.encode_sentence_bert(
+            self.tokenizer,
+            queries,
+            batch_size=batch_size,
+            is_q=True,
+            maxlen=self.max_length,
+        )
 
     # Write your own encoding corpus function (Returns: Document embeddings as numpy array)  out_features
     def encode_corpus(
         self, corpus: list[dict[str, str]] | dict[str, list] | list[str], batch_size: int, **kwargs
     ) -> np.ndarray:
         sentences = extract_corpus_sentences(corpus=corpus, sep=self.sep)
-        return self.model.encode_sentence_bert(self.tokenizer, sentences, maxlen=self.max_length)
+        return self.model.encode_sentence_bert(
+            self.tokenizer,
+            sentences,
+            batch_size=batch_size,
+            maxlen=self.max_length,
+        )
 
 
 # Chunks of this code has been taken from: https://github.com/naver/splade/blob/main/beir_evaluation/models.py
 # For more details, please refer to SPLADE by Thibault Formal, Benjamin Piwowarski and Stéphane Clinchant (https://arxiv.org/abs/2107.05720)
 class SpladeNaver(torch.nn.Module):
-    def __init__(self, model_path):
+    def __init__(self, model_path, revision: str | None = None):
         super().__init__()
-        self.transformer = AutoModelForMaskedLM.from_pretrained(model_path)
+        self.transformer = AutoModelForMaskedLM.from_pretrained(
+            model_path,
+            revision=revision,
+            use_safetensors=True,
+        )
 
     def forward(self, **kwargs):
         out = self.transformer(**kwargs)["logits"]  # output (logits) of MLM head, shape (bs, pad_len, voc_size)

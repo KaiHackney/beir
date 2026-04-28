@@ -130,6 +130,85 @@ class OpenAIHypothesisGenerator:
         return [choice.message.content.strip() for choice in response.choices if choice.message.content]
 
 
+class HuggingFaceHypothesisGenerator:
+    """Local Hugging Face generator for HyDE hypotheses.
+
+    Supports encoder-decoder models such as FLAN-T5 and causal language models
+    such as Mistral-style instruction models.
+    """
+
+    def __init__(
+        self,
+        model_name: str = "google/flan-t5-base",
+        n: int = 3,
+        max_new_tokens: int = 256,
+        temperature: float | None = 0.7,
+        top_p: float | None = 0.95,
+        do_sample: bool = True,
+        device: str | None = None,
+        model_kwargs: dict | None = None,
+        tokenizer_kwargs: dict | None = None,
+        generation_kwargs: dict | None = None,
+    ):
+        try:
+            from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForSeq2SeqLM, AutoTokenizer
+        except ImportError as exc:
+            raise ImportError("Install transformers and torch to use local Hugging Face HyDE generation.") from exc
+
+        self.model_name = model_name
+        self.n = n
+        self.max_new_tokens = max_new_tokens
+        self.temperature = temperature
+        self.top_p = top_p
+        self.do_sample = do_sample
+        self.generation_kwargs = generation_kwargs or {}
+
+        tokenizer_kwargs = tokenizer_kwargs or {}
+        model_kwargs = model_kwargs or {}
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, **tokenizer_kwargs)
+        config = AutoConfig.from_pretrained(model_name)
+        self.is_encoder_decoder = bool(getattr(config, "is_encoder_decoder", False))
+        model_cls = AutoModelForSeq2SeqLM if self.is_encoder_decoder else AutoModelForCausalLM
+        self.model = model_cls.from_pretrained(model_name, **model_kwargs)
+
+        self.device = device or self._default_device()
+        logger.info(f"Use pytorch device for HyDE generation: {self.device}")
+        self.model = self.model.to(self.device)
+        self.model.eval()
+
+        if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+
+    @staticmethod
+    def _default_device() -> str:
+        if torch.cuda.is_available():
+            return "cuda"
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
+
+    def generate(self, prompt: str) -> list[str]:
+        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True).to(self.device)
+        params = {
+            "max_new_tokens": self.max_new_tokens,
+            "do_sample": self.do_sample,
+            "num_return_sequences": self.n,
+            **self.generation_kwargs,
+        }
+        if self.temperature is not None and self.do_sample:
+            params["temperature"] = self.temperature
+        if self.top_p is not None and self.do_sample:
+            params["top_p"] = self.top_p
+
+        with torch.no_grad():
+            outputs = self.model.generate(**inputs, **params)
+
+        decoded = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        if not self.is_encoder_decoder:
+            decoded = [text[len(prompt) :].strip() if text.startswith(prompt) else text.strip() for text in decoded]
+        return [text.strip() for text in decoded if text and text.strip()]
+
+
 class JsonlHyDECache:
     """Small append-only cache keyed by the raw query text."""
 
@@ -173,9 +252,12 @@ class HyDE:
         include_original_query: bool = True,
         hypothesis_encoder: str = "corpus",
         max_hypotheses: int | None = None,
+        aggregation: str = "mean",
     ):
         if hypothesis_encoder not in {"corpus", "query"}:
             raise ValueError("hypothesis_encoder must be either 'corpus' or 'query'")
+        if aggregation not in {"mean", "sum", "max"}:
+            raise ValueError("aggregation must be one of 'mean', 'sum', or 'max'")
 
         self.base_model = base_model
         self.generator = generator
@@ -184,6 +266,7 @@ class HyDE:
         self.include_original_query = include_original_query
         self.hypothesis_encoder = hypothesis_encoder
         self.max_hypotheses = max_hypotheses
+        self.aggregation = aggregation
 
     def encode_corpus(self, corpus, batch_size: int = 8, **kwargs):
         return self.base_model.encode_corpus(corpus, batch_size=batch_size, **kwargs)
@@ -219,7 +302,7 @@ class HyDE:
             if not query_embeddings:
                 raise ValueError("HyDE could not create any embeddings for a query.")
 
-            embeddings.append(torch.stack(query_embeddings).mean(dim=0))
+            embeddings.append(self._aggregate_embeddings(torch.stack(query_embeddings)))
 
         embeddings = torch.stack(embeddings)
         if kwargs.get("convert_to_tensor", False):
@@ -253,6 +336,13 @@ class HyDE:
         if self.max_hypotheses is not None:
             cleaned = cleaned[: self.max_hypotheses]
         return cleaned
+
+    def _aggregate_embeddings(self, embeddings: torch.Tensor) -> torch.Tensor:
+        if self.aggregation == "mean":
+            return embeddings.mean(dim=0)
+        if self.aggregation == "sum":
+            return embeddings.sum(dim=0)
+        return embeddings.max(dim=0).values
 
     @staticmethod
     def _to_tensor_matrix(embeddings) -> torch.Tensor:
