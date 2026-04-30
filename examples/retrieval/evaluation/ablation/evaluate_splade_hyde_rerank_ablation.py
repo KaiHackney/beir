@@ -10,10 +10,12 @@ Produces up to four runs:
 """
 
 import csv
+import hashlib
 import json
 import logging
 import os
 import pathlib
+from collections import defaultdict
 
 from beir import LoggingHandler, util
 from beir.datasets.data_loader import GenericDataLoader
@@ -38,6 +40,63 @@ def parse_list(name: str, default: str) -> list[str]:
 
 def copy_run(results: dict[str, dict[str, float]]) -> dict[str, dict[str, float]]:
     return {qid: dict(scores) for qid, scores in results.items()}
+
+
+def ranked_docs(run: dict[str, float]) -> list[str]:
+    return [doc_id for doc_id, _ in sorted(run.items(), key=lambda item: item[1], reverse=True)]
+
+
+def rrf_fuse(
+    runs: list[tuple[float, dict[str, dict[str, float]]]],
+    top_k: int,
+    rrf_k: int = 60,
+) -> dict[str, dict[str, float]]:
+    fused = {}
+    query_ids = set()
+    for _, run in runs:
+        query_ids.update(run.keys())
+
+    for qid in query_ids:
+        scores = defaultdict(float)
+        for weight, run in runs:
+            for rank, doc_id in enumerate(ranked_docs(run.get(qid, {})), start=1):
+                scores[doc_id] += weight / (rrf_k + rank)
+        fused[qid] = dict(sorted(scores.items(), key=lambda item: item[1], reverse=True)[:top_k])
+    return fused
+
+
+def minmax_scores(scores: dict[str, float]) -> dict[str, float]:
+    if not scores:
+        return {}
+    values = list(scores.values())
+    low = min(values)
+    high = max(values)
+    if high == low:
+        return {doc_id: 1.0 for doc_id in scores}
+    return {doc_id: (score - low) / (high - low) for doc_id, score in scores.items()}
+
+
+def fuse_rerank_with_first_stage(
+    first_stage: dict[str, dict[str, float]],
+    reranked: dict[str, dict[str, float]],
+    alpha: float,
+    top_k: int,
+) -> dict[str, dict[str, float]]:
+    fused = {}
+    for qid, original_scores in first_stage.items():
+        rerank_scores = reranked.get(qid, {})
+        original_norm = minmax_scores(original_scores)
+        rerank_norm = minmax_scores(rerank_scores)
+        scores = {}
+
+        for doc_id in original_scores:
+            if doc_id in rerank_norm:
+                scores[doc_id] = alpha * rerank_norm[doc_id] + (1.0 - alpha) * original_norm.get(doc_id, 0.0)
+            else:
+                scores[doc_id] = (1.0 - alpha) * original_norm.get(doc_id, 0.0)
+
+        fused[qid] = dict(sorted(scores.items(), key=lambda item: item[1], reverse=True)[:top_k])
+    return fused
 
 
 def evaluate_and_save(
@@ -96,14 +155,23 @@ def build_hyde_model(base_model, dataset: str, results_dir: str):
     generator_slug = generator_model.replace("/", "_")
     temperature = os.getenv("HYDE_TEMPERATURE")
     top_p = os.getenv("HYDE_TOP_P")
+    hyde_n = int(os.getenv("HYDE_N", "1"))
+    max_new_tokens = int(os.getenv("HYDE_MAX_NEW_TOKENS", "48"))
+    do_sample = os.getenv("HYDE_DO_SAMPLE", "false").lower() == "true"
+    prompt_template = os.getenv("HYDE_PROMPT_TEMPLATE") or ""
+    prompt_hash = hashlib.sha1(prompt_template.encode("utf-8")).hexdigest()[:8]
+    cache_name = os.getenv(
+        "HYDE_CACHE_NAME",
+        f"{dataset}.{generator_slug}.n{hyde_n}.tok{max_new_tokens}.sample{int(do_sample)}.{prompt_hash}.jsonl",
+    )
 
     generator = models.HuggingFaceHypothesisGenerator(
         model_name=generator_model,
-        n=int(os.getenv("HYDE_N", "1")),
-        max_new_tokens=int(os.getenv("HYDE_MAX_NEW_TOKENS", "48")),
+        n=hyde_n,
+        max_new_tokens=max_new_tokens,
         temperature=float(temperature) if temperature else 0.7,
         top_p=float(top_p) if top_p else 0.95,
-        do_sample=os.getenv("HYDE_DO_SAMPLE", "false").lower() == "true",
+        do_sample=do_sample,
         device=os.getenv("HYDE_GENERATOR_DEVICE") or None,
     )
 
@@ -112,9 +180,9 @@ def build_hyde_model(base_model, dataset: str, results_dir: str):
         generator=generator,
         prompt_builder=models.HyDEPromptBuilder(
             dataset=dataset,
-            template=os.getenv("HYDE_PROMPT_TEMPLATE") or None,
+            template=prompt_template or None,
         ),
-        cache_path=os.path.join(results_dir, "hyde_cache", f"{dataset}.{generator_slug}.jsonl"),
+        cache_path=os.path.join(results_dir, "hyde_cache", cache_name),
         include_original_query=os.getenv("HYDE_INCLUDE_QUERY", "true").lower() == "true",
         hypothesis_encoder=os.getenv("HYDE_HYPOTHESIS_ENCODER", "corpus"),
         max_hypotheses=int(os.getenv("HYDE_MAX_HYPOTHESES")) if os.getenv("HYDE_MAX_HYPOTHESES") else None,
@@ -126,6 +194,10 @@ dataset = os.getenv("BEIR_DATASET", "scifact")
 split = os.getenv("BEIR_SPLIT", "test")
 variants = parse_list("SPLADE_ABLATION_VARIANTS", "splade,splade_hyde,splade_rerank,splade_hyde_rerank")
 top_k = int(os.getenv("ABLATION_TOP_K", "1000"))
+hyde_fusion = os.getenv("HYDE_FUSION", "none").lower()
+hyde_fusion_weight = float(os.getenv("HYDE_FUSION_WEIGHT", "0.5"))
+hyde_rrf_k = int(os.getenv("HYDE_RRF_K", "60"))
+rerank_score_alpha = float(os.getenv("RERANK_SCORE_ALPHA", "1.0"))
 k_values = [1, 3, 5, 10, 100, 1000]
 
 script_dir = pathlib.Path(__file__).parent.absolute()
@@ -159,7 +231,17 @@ if "splade_hyde" in variants or "splade_hyde_rerank" in variants:
     logger.info("Running SPLADE with HyDE query expansion...")
     hyde_model = build_hyde_model(splade_model, dataset, results_dir)
     hyde_searcher = build_sparse_searcher(hyde_model, index_dir=index_dir, initialize=False)
-    runs["splade_hyde"] = hyde_searcher.search(corpus, queries, top_k, score_function="dot")
+    runs["splade_hyde_raw"] = hyde_searcher.search(corpus, queries, top_k, score_function="dot")
+    if hyde_fusion == "rrf":
+        runs["splade_hyde"] = rrf_fuse(
+            [(1.0 - hyde_fusion_weight, runs["splade"]), (hyde_fusion_weight, runs["splade_hyde_raw"])],
+            top_k=top_k,
+            rrf_k=hyde_rrf_k,
+        )
+    elif hyde_fusion == "none":
+        runs["splade_hyde"] = runs["splade_hyde_raw"]
+    else:
+        raise ValueError("HYDE_FUSION must be either 'none' or 'rrf'.")
 
     if "splade_hyde" in variants:
         summaries.append(
@@ -178,16 +260,28 @@ if "splade_rerank" in variants or "splade_hyde_rerank" in variants:
     if "splade_rerank" in variants:
         logger.info("Reranking base SPLADE results...")
         reranked = reranker.rerank(corpus, queries, runs["splade"], top_k=rerank_top_k)
-        runs["splade_rerank"] = reranked
-        summaries.append(evaluate_and_save(f"{dataset}.splade_rerank", reranked, qrels, k_values, results_dir))
+        runs["splade_rerank"] = fuse_rerank_with_first_stage(
+            runs["splade"],
+            reranked,
+            alpha=rerank_score_alpha,
+            top_k=top_k,
+        )
+        summaries.append(evaluate_and_save(f"{dataset}.splade_rerank", runs["splade_rerank"], qrels, k_values, results_dir))
 
     if "splade_hyde_rerank" in variants:
         if "splade_hyde" not in runs:
             raise ValueError("splade_hyde_rerank requires splade_hyde retrieval.")
         logger.info("Reranking SPLADE+HyDE results...")
         reranked = reranker.rerank(corpus, queries, runs["splade_hyde"], top_k=rerank_top_k)
-        runs["splade_hyde_rerank"] = reranked
-        summaries.append(evaluate_and_save(f"{dataset}.splade_hyde_rerank", reranked, qrels, k_values, results_dir))
+        runs["splade_hyde_rerank"] = fuse_rerank_with_first_stage(
+            runs["splade_hyde"],
+            reranked,
+            alpha=rerank_score_alpha,
+            top_k=top_k,
+        )
+        summaries.append(
+            evaluate_and_save(f"{dataset}.splade_hyde_rerank", runs["splade_hyde_rerank"], qrels, k_values, results_dir)
+        )
 
 summary_path = os.path.join(results_dir, "summary.json")
 with open(summary_path, "w", encoding="utf-8") as f:
